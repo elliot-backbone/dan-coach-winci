@@ -226,7 +226,31 @@ jobs:
           SERVER="${GITHUB_WORKSPACE}/coach-plugin/runtime/api/server.mjs"
           test -f "$SERVER" || { echo "missing $SERVER"; exit 1; }
 
-          claude mcp add coach -s user -e 'COACH_ROOT=C:\coach' -- node "$SERVER"
+          # add-json, NOT `add -e`, AND THE REASON IS MEASURED. Run 33104655356 registered
+          # successfully and then reported `Failed to connect - -32000: Connection closed`.
+          # The store itself was fine: the step before it opened the same store with the same
+          # COACH_ROOT and printed integrity ok. The difference is how the value travelled.
+          # Git Bash applies MSYS path conversion to arguments, so `-e COACH_ROOT=C:\coach`
+          # does not necessarily reach the child as that string, and a server that cannot find
+          # its store exits, which the client reports only as a closed connection.
+          # add-json takes one JSON document and skips argument parsing, and MSYS_NO_PATHCONV
+          # stops the shell rewriting the path inside it.
+          export MSYS_NO_PATHCONV=1
+          claude mcp remove coach -s user >/dev/null 2>&1 || true
+          claude mcp add-json coach "{\"type\":\"stdio\",\"command\":\"node\",\"args\":[\"${SERVER}\"],\"env\":{\"COACH_ROOT\":\"C:\\\\coach\"}}" --scope user
+
+          # READ BACK WHAT ACTUALLY LANDED. A registration that reports success and stores the
+          # wrong env is exactly the silent shape this workflow exists to catch, so the stored
+          # document is printed rather than assumed. It contains no secret: a path and a
+          # command.
+          echo '--- coach entry as stored in ~/.claude.json:'
+          node -e "
+            const fs=require('fs'), os=require('os'), p=require('path');
+            const f=p.join(os.homedir(),'.claude.json');
+            const j=JSON.parse(fs.readFileSync(f,'utf8'));
+            const c=(j.mcpServers||{}).coach;
+            console.log(c ? JSON.stringify(c,null,2) : 'NO coach ENTRY FOUND in '+f);
+          "
 
           # CLIENT-SIDE READBACK, and the distinction is load-bearing (VM-TESTER, 2026-08-27).
           # Spawning server.mjs proves the SERVER runs and says nothing about whether the CLIENT
@@ -236,7 +260,11 @@ jobs:
           claude mcp list 2>&1 | tee /tmp/mcp-list.txt
           grep -q 'coach' /tmp/mcp-list.txt || { echo 'FAIL Claude Code does not see the coach server'; exit 1; }
           grep -Eq 'coach.*(Connected|✔)' /tmp/mcp-list.txt || {
-            echo 'FAIL Claude Code sees coach but reports it NOT connected'; exit 1; }
+            echo 'FAIL Claude Code sees coach but reports it NOT connected.'
+            echo '--- running the server by hand with the same env, to surface its own error:'
+            echo 'the client reports only "Connection closed"; the server says why.'
+            COACH_ROOT='C:\coach' node "$SERVER" </dev/null 2>&1 | head -20 || true
+            exit 1; }
           echo 'PASS coach is registered user-scope AND the client reports it connected'
 
       - name: Count the tools before you ever see them
