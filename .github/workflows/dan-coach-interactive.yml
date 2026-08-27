@@ -1,0 +1,317 @@
+# An interactive Dan Coach session on a real Windows machine.
+#
+# THE POINT: Dan uses Coach in Claude Code on Windows. This gets you a Windows machine with
+# exactly that, and hands you an SSH line so you sit in front of it yourself. No harness, no
+# simulation, no model standing between you and Coach.
+#
+# WHY THIS EXISTS ALONGSIDE dan-coach-windows.yml: that workflow targets a SELF-HOSTED runner
+# labelled dan-coach-private-git-vm. No such runner has ever been registered (measured
+# 2026-08-27: total_count 0), so it has never run and cannot run until someone provisions that
+# machine. This one uses a GitHub-hosted windows-latest runner, the shape proven on the Bill
+# Coach build. It is the LIVED-USE lane, not the packaged-release lane.
+#
+# WHY IT LIVES IN A PUBLIC REPOSITORY. GitHub does not bill Actions minutes on public repos and
+# does bill them on private ones, at double rate for Windows. On 2026-08-27 the private-repo
+# version of this run was refused by GitHub before executing a single step: "the job was not
+# started because recent account payments have failed or your spending limit needs to be
+# increased". bill-coach-winci has been running Windows jobs free on exactly this arrangement,
+# most recently 2026-08-25. Nothing private lives here: the code and the store are fetched at
+# run time from elliot-backbone/dan-coach.
+#
+# THE STORE NEVER ENTERS GIT, in this repository or in the private one. dan-coach.sqlite is
+# 1.23 GB of Dan's record, fetched from a private release asset and deleted in an always-step.
+#
+# THIS LOG IS WORLD-READABLE. Nothing derived from Dan's record is printed. The steps below
+# print file sizes, a schema version, an integrity verdict and the twelve tool NAMES, which are
+# product surface. No row, no passage, no answer. Keep it that way when editing.
+#
+# ACCESS IS LOCKED TO YOU. limit-access-to-actor means only the GitHub account that started the
+# run can connect, even though the SSH line appears in this public log.
+
+name: dan-coach-interactive
+
+on:
+  workflow_dispatch:
+    inputs:
+      serve_commit:
+        description: 'Exact serve commit whose schema matches the store (receipt: a18f283a)'
+        required: true
+        default: 'a18f283a56c4a4bfd75cb7f63756476557698a94'
+      store_release_tag:
+        description: 'Release tag holding the promoted dan-coach.sqlite asset'
+        required: true
+        default: 'store-20260827'
+      expected_store_sha256:
+        description: 'SHA-256 of the BACKUP-API COPY that was uploaded (not the live file)'
+        required: true
+        default: '8071b8de119786fa6b65b8ddc392efdf8d6f5038749c5f25ac0d8835f929c8ee'
+      minutes:
+        description: 'How long to hold the session open'
+        required: true
+        default: '240'
+
+permissions:
+  contents: read
+
+jobs:
+  session:
+    runs-on: windows-latest
+    timeout-minutes: 358
+
+    steps:
+      # FAIL ON THE MISSING CREDENTIAL FIRST, BY NAME. Without this the run dies inside
+      # actions/checkout with a 404 on a repository that plainly exists, which reads as a wrong
+      # repo name or a deleted commit and sends the reader looking in the wrong place.
+      - name: Refuse early if the read token is absent
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.DAN_COACH_READ_TOKEN }}
+        run: |
+          if [ -z "${TOKEN:-}" ]; then
+            echo 'DAN_COACH_READ_TOKEN is not set on this repository.'
+            echo 'It is a fine-grained personal access token, contents:read, on'
+            echo 'elliot-backbone/dan-coach ONLY. Add it with:'
+            echo '  gh secret set DAN_COACH_READ_TOKEN -R elliot-backbone/dan-coach-winci'
+            exit 1
+          fi
+          echo 'PASS read token is present'
+
+      # THE PRODUCT CODE LIVES IN THE PRIVATE REPOSITORY AND IS FETCHED, NEVER MIRRORED HERE.
+      # actions/checkout is given an explicit repository and token rather than a hand-rolled
+      # `git clone https://$TOKEN@...`, because the action installs the credential as a masked
+      # extraheader. A token pasted into a clone URL can surface in an error line, and error
+      # lines in THIS repository are world-readable.
+      - name: Check out the exact serve commit from the private repository
+        uses: actions/checkout@v4
+        with:
+          repository: elliot-backbone/dan-coach
+          ref: ${{ github.event.inputs.serve_commit }}
+          token: ${{ secrets.DAN_COACH_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Prove the checkout is the requested commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -cne '${{ github.event.inputs.serve_commit }}') {
+            throw "checkout is $head, not the requested serve commit"
+          }
+          # The store must never be in Git. If one is here, the repo has been polluted.
+          $dbs = @(Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -File -Recurse |
+            Where-Object { $_.Name -match '\.(sqlite3?|db3?)(-(wal|shm))?$' })
+          if ($dbs.Count -ne 0) { throw "a database exists in the Git checkout: $($dbs[0].FullName)" }
+          Write-Host "PASS checkout $head, no database in Git"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+
+      - name: Prove node:sqlite is available
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Coach has ZERO external dependencies and opens the store through node:sqlite.
+          # A Node without it fails later inside the MCP handshake, where the error is opaque.
+          node -e "const {DatabaseSync}=require('node:sqlite'); console.log('node:sqlite ok')"
+          node --version
+
+      - name: Install Claude Code
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Fetch the promoted store from the private release
+        shell: pwsh
+        env:
+          # NOT github.token. This repository's own token cannot read the private repository,
+          # which is the entire point of the split. The release asset is the reason a TOKEN is
+          # needed at all rather than the deploy key bill-coach-winci uses: a deploy key is SSH
+          # only, and release assets are served by the REST API.
+          GH_TOKEN: ${{ secrets.DAN_COACH_READ_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = '${{ github.event.inputs.expected_store_sha256 }}'
+          if ($expected -cnotmatch '^[0-9a-f]{64}$') { throw 'expected_store_sha256 must be lowercase SHA-256' }
+
+          $stateDir = 'C:\coach\state'
+          New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+          gh release download '${{ github.event.inputs.store_release_tag }}' `
+            -R elliot-backbone/dan-coach -p 'dan-coach.sqlite' -D $stateDir
+          if ($LASTEXITCODE -ne 0) { throw 'release download failed' }
+
+          $db = Join-Path $stateDir 'dan-coach.sqlite'
+          $actual = (Get-FileHash -LiteralPath $db -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -cne $expected) {
+            throw "torn transfer: store hash $actual does not match the uploaded copy $expected"
+          }
+          Write-Host "PASS store $([math]::Round((Get-Item $db).Length/1GB,2)) GB, hash matches the backup copy"
+
+          # One physical database, no sidecars. The one-datastore ruling, checked not assumed.
+          $all = @(Get-ChildItem -LiteralPath $stateDir -File -Recurse)
+          if ($all.Count -ne 1 -or $all[0].Name -cne 'dan-coach.sqlite') {
+            throw "state must hold exactly dan-coach.sqlite, found: $($all.Name -join ', ')"
+          }
+
+          # WAL creates -wal/-shm BESIDE the store, so the DIRECTORY must be writable.
+          # A read-only directory fails at first query, not at open (F-VMT-9).
+          $probe = Join-Path $stateDir '.writeprobe'
+          Set-Content -LiteralPath $probe -Value 'x'; Remove-Item -LiteralPath $probe
+          Write-Host 'PASS state directory is writable'
+
+      # NOTE ON SHELL CHOICE, because it is not a style preference and reverting it breaks the
+      # file: the two probe steps below write a .mjs script, and a PowerShell here-string
+      # REQUIRES its '@ terminator at column 0, which terminates the indented YAML block scalar
+      # around it. The two requirements are in direct conflict and the workflow will not parse.
+      # bash (Git Bash, present on windows-latest) takes an ordinary indented heredoc.
+      - name: Prove the store opens through Coach's own gate
+        shell: bash
+        env:
+          COACH_ROOT: 'C:\coach'
+        run: |
+          set -euo pipefail
+          # The startup gate refuses a wrong-revision store BY NAME. Running it here means a
+          # schema mismatch is found now, with the log open, not inside a chat session.
+          cat > gate.mjs <<'EOF'
+          import { openCoachStore } from './coach-plugin/runtime/store/unified/open-coach-store.mjs';
+          const db = openCoachStore();
+          const q = (s) => db.prepare(s).get();
+          console.log(JSON.stringify({
+            user_version: q('PRAGMA user_version').user_version,
+            integrity: q('PRAGMA integrity_check').integrity_check
+          }));
+          db.close();
+          EOF
+          # `|| true` so a THROW is reported by this step's own message rather than by set -e
+          # killing the step before it can say what happened. The case below still fails the
+          # run. Proven both ways on the host: a missing store exits 1 naming
+          # `unified_store_missing`, the promoted copy prints user_version 3, integrity ok.
+          out=$(node gate.mjs 2>&1 || true)
+          rm -f gate.mjs
+          echo "gate says: $out"
+          case "$out" in
+            *'"integrity":"ok"'*) echo 'PASS store opens clean' ;;
+            *) echo "FAIL store did not open clean"; exit 1 ;;
+          esac
+
+      - name: Register Coach the way Dan's machine does
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # THE ROUTE OF RECORD (runbook 7.6). User scope is the one registration that attaches
+          # on Windows: the estate has measured plugin .mcp.json and --mcp-config failing
+          # SILENTLY here, which looks like a working Coach with no tools.
+          $server = Join-Path $env:GITHUB_WORKSPACE 'coach-plugin\runtime\api\server.mjs'
+          if (-not (Test-Path -LiteralPath $server -PathType Leaf)) { throw "missing $server" }
+          claude mcp add coach -s user -e COACH_ROOT=C:\coach -- node $server
+          if ($LASTEXITCODE -ne 0) { throw 'claude mcp add failed' }
+
+          $list = (& claude mcp list 2>&1 | Out-String)
+          Write-Host $list
+          if ($list -notmatch 'coach') { throw 'Claude Code does not see the coach server' }
+          Write-Host 'PASS coach is registered user-scope'
+
+      - name: Count the tools before you ever see them
+        shell: bash
+        env:
+          COACH_ROOT: 'C:\coach'
+        run: |
+          set -euo pipefail
+          # 12 tools is the number of record. 10 means the wrong checkout; 0 means the
+          # registration scope is wrong. Both are SILENT in a chat window, so they are counted
+          # here, where a wrong number stops the run.
+          cat > tools-probe.mjs <<'EOF'
+          import { spawn } from 'node:child_process';
+          const child = spawn('node', [process.argv[2]], { stdio: ['pipe', 'pipe', 'inherit'] });
+          const send = (o) => child.stdin.write(JSON.stringify(o) + '\n');
+          let buf = '';
+          child.stdout.on('data', (d) => {
+            buf += d;
+            const lines = buf.split('\n');
+            buf = lines.pop();
+            for (const line of lines) {
+              let m; try { m = JSON.parse(line); } catch { continue; }
+              if (m.id === 1) send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+              if (m.id === 2) {
+                const names = (m.result?.tools ?? []).map((t) => t.name);
+                console.log('TOOLS=' + names.length);
+                console.log(names.join(', '));
+                child.kill();
+                process.exit(names.length === 12 ? 0 : 1);
+              }
+            }
+          });
+          send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'probe', version: '1' } } });
+          child.on('exit', (c) => { console.log('TOOLS=server-exited-' + c); process.exit(1); });
+          setTimeout(() => { console.log('TOOLS=timeout'); process.exit(1); }, 60000);
+          EOF
+          node tools-probe.mjs coach-plugin/runtime/api/server.mjs
+          rm -f tools-probe.mjs
+
+      - name: How to use this session
+        shell: pwsh
+        run: |
+          Write-Host ''
+          Write-Host '================ COACH IS RUNNING ================'
+          Write-Host ''
+          Write-Host '  Connect with the SSH line below, then run:'
+          Write-Host ''
+          Write-Host '      claude'
+          Write-Host ''
+          Write-Host '  First launch asks for a one-time Claude sign-in. It prints a URL:'
+          Write-Host '  open it in your own browser, approve, paste the code back.'
+          Write-Host ''
+          Write-Host '  Then just talk. Try:  what is the latest picture on ASOS?'
+          Write-Host ''
+          Write-Host '  Store:   C:\coach\state\dan-coach.sqlite  (1.23 GB, hash-verified)'
+          Write-Host '  Serve:   ${{ github.event.inputs.serve_commit }}'
+          Write-Host '  Ends when you type exit, or after ${{ github.event.inputs.minutes }} minutes.'
+          Write-Host ''
+          Write-Host '  Everything is destroyed with the runner. Nothing is uploaded.'
+          Write-Host ''
+          Write-Host '=================================================='
+
+      - name: Open the session
+        id: tmate
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+          detached: true
+
+      - name: Publish the connection string
+        shell: bash
+        env:
+          TMATE_SSH_COMMAND: ${{ steps.tmate.outputs.ssh-command }}
+        run: |
+          ssh_line="${TMATE_SSH_COMMAND:-}"
+          if [[ -z "$ssh_line" || "$ssh_line" != ssh\ * || "$ssh_line" == *$'\n'* ]]; then
+            echo "::error title=No valid connection string::action-tmate did not return one SSH command"
+            exit 1
+          fi
+          echo "::notice title=Connect with this::${ssh_line}"
+          { echo "### Connect"; echo '```'; echo "${ssh_line}"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hold the runner open
+        shell: pwsh
+        run: |
+          $minutes = [int]'${{ github.event.inputs.minutes }}'
+          Write-Host "Session open for $minutes minutes. Connect with the SSH command above."
+          Write-Host 'It ends early if you delete this file from inside the session:'
+          Write-Host "  $env:RUNNER_TEMP\keep-open"
+          New-Item -ItemType File -Path "$env:RUNNER_TEMP\keep-open" -Force | Out-Null
+          $deadline = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $deadline -and (Test-Path "$env:RUNNER_TEMP\keep-open")) {
+            Start-Sleep -Seconds 15
+          }
+          Write-Host 'Session closing.'
+
+      - name: Leave nothing behind
+        if: always()
+        shell: pwsh
+        run: |
+          # The runner is discarded anyway, but an aborted job should not leave Dan's record
+          # sitting on a machine that is still running.
+          Remove-Item -Recurse -Force 'C:\coach' -ErrorAction SilentlyContinue
+          Write-Host 'store removed'
