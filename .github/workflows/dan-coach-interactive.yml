@@ -97,11 +97,26 @@ jobs:
           if ($head -cne '${{ github.event.inputs.serve_commit }}') {
             throw "checkout is $head, not the requested serve commit"
           }
-          # The store must never be in Git. If one is here, the repo has been polluted.
-          $dbs = @(Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -File -Recurse |
+          # THE INVARIANT IS ABOUT THE SERVING STORE, NOT ABOUT THE WORD SQLITE.
+          # First edition of this guard refused ANY .sqlite in the checkout and duly failed the
+          # first real run on fleet/CORPUS-EXTRACT-V2/disposable/reading-corpus.pilot.sqlite.
+          # That file is a committed disposable corpus artifact, not Dan's record, and refusing
+          # it stopped a run for a condition that was never the risk. The risk is a SERVING
+          # store riding in with the code and being opened instead of the promoted one, which
+          # would be silent. So: refuse on the serving name, and REPORT the rest rather than
+          # either blocking on them or pretending they are not there.
+          $serving = @(Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -File -Recurse |
+            Where-Object { $_.Name -ceq 'dan-coach.sqlite' })
+          if ($serving.Count -ne 0) {
+            throw "a serving store exists in the Git checkout: $($serving[0].FullName)"
+          }
+          $others = @(Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -File -Recurse |
             Where-Object { $_.Name -match '\.(sqlite3?|db3?)(-(wal|shm))?$' })
-          if ($dbs.Count -ne 0) { throw "a database exists in the Git checkout: $($dbs[0].FullName)" }
-          Write-Host "PASS checkout $head, no database in Git"
+          Write-Host "PASS checkout $head, no serving store in Git"
+          Write-Host "NOTE $($others.Count) other database file(s) are committed in this repo:"
+          foreach ($o in $others) {
+            Write-Host ("  {0} ({1:N0} bytes)" -f $o.FullName.Replace($env:GITHUB_WORKSPACE, ''), $o.Length)
+          }
 
       - uses: actions/setup-node@v4
         with:
