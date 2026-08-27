@@ -1,6 +1,8 @@
 <!-- AUDIENCE: MACHINE -->
 # FINDING · WINDOWS MCP ATTACHMENT · read-only investigation · 2026-08-27
 
+AMENDED-THROUGH: 2026-08-27 §8 (root cause found; §3-§4 hypotheses superseded, marked inline)
+
 SCOPE: the operator asked one question. Are the five failed runs an instance of F-VMT-47?
 METHOD: read-only. Existing run logs, the Bill package on disk, no new dispatch, no writes.
 ANSWER: **NO, AND THE EVIDENCE POINTS THE OTHER WAY.** Detail below, with what is not known.
@@ -44,6 +46,11 @@ run.
 
 ## 3 THE CONTROLLED COMPARISON, and it is a good one
 
+**SUPERSEDED 2026-08-27 BY §8.** Both residual variables below (path separators, store size)
+were subsequently tested and BOTH ARE DEAD: run 33108029320 failed identically with a fully
+forward-slash path, on client 2.1.247 and on the Bill pin 2.1.238. The section stands as the
+reasoning that motivated the probe, not as a live hypothesis.
+
 `bill-coach-winci` passes this same gate on the same runner class. Read from its workflow and
 its shipped package rather than recalled:
 
@@ -61,6 +68,10 @@ F-VMT-47 describes is not what separates them. Two variables remain: the mixed p
 in the args, and a store 27x larger.
 
 ## 4 WHAT THE 1.1 SECONDS ARGUES, stated as inference and labelled as such
+
+**SUPERSEDED 2026-08-27 BY §8.** The path inference below was tested and disproven. What the
+1.1 seconds actually argued — child dies before touching the store — was correct; the cause
+was the entry guard, not the path.
 
 Store size explains a slow open. It does not explain a death before the store is touched. That
 makes the SIZE variable the weaker of the two, and the PATH variable the stronger, on this
@@ -98,3 +109,48 @@ that could not fail.
 
 No runs dispatched. No files changed outside this report. No writes to any store. The pause
 holds.
+
+
+## 8 ROOT CAUSE · found in run 33108029320, closing §3, §4 and §6.3
+
+**`server.mjs:573` at a18f283a:**
+
+```js
+if (import.meta.url === `file://${process.argv[1]}`) {
+```
+
+POSIX: `argv[1]` is `/Users/...`, the concatenation equals `import.meta.url`, the server
+starts. WINDOWS: `argv[1]` is `D:\a\...\server.mjs` while `import.meta.url` is
+`file:///D:/a/...` — STRUCTURALLY UNEQUAL IN EVERY SPELLING. The module loads, the guard is
+false, nothing holds the event loop, node EXITS 0, the client reports `Connection closed`.
+
+THE DECISIVE MEASUREMENT, from the repaired handshake probe on the runner:
+`SERVER EXITED code=0 signal=null`, no stderr. A clean voluntary exit without answering
+initialize. Consistent with every prior number: 1.1 s vs the 11.3 s store open (the store is
+never reached), both client versions, both path forms.
+
+BOTH §3 RESIDUAL VARIABLES TESTED AND DEAD in the same run: forward-slash path fails
+identically; 2.1.238 fails identically to 2.1.247.
+
+THE SHIPPED PRODUCT ALREADY KNEW: `windows/runtime/coach-mcp-entry.mjs`'s header states the
+canonical direct-entry comparison is POSIX-shaped and exists precisely to own the stdio
+lifecycle instead. So the packaged activation route is correct by design on this point, and
+**RUNBOOK 7.6's FALLBACK COMMAND (`claude mcp add ... -- node ...\server.mjs`) IS A
+STRUCTURAL NO-OP ON WINDOWS.** Its 12-tool EXPECT was only ever validated on macOS,
+VM-TESTER's pair-run included.
+
+F-VMT-47 REFRAMED: with `server.mjs` as the target, BOTH routes register a server that exits
+instantly on Windows; route choice is unreachable until the entry is Windows-safe. The shipped
+product's exposure reduces to the async-attach question only, which remains open and unmeasured.
+
+PROPOSED REMEDIATION, carried with the finding per the standing rule:
+1. RUNBOOK s7.6: the fallback registers `windows\runtime\coach-mcp-entry.mjs`, never
+   `server.mjs`.
+2. PRODUCT, one line at `server.mjs:573`:
+   `import.meta.url === pathToFileURL(process.argv[1]).href` — correct on both platforms.
+Landing spots: RUNBOOK-PROMOTION-SMOKE-VM-2026-08.md s7.6 and the product defect register.
+Routing is the coordinator's.
+
+THIS LANE'S FIX: a wrapper lifting the server.mjs entry block verbatim minus the guard,
+proven on the host (HANDSHAKE OK server=coach, TOOLS=12; heredoc body diffed identical to the
+proven file). Dispatched as run 33108478227.
