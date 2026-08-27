@@ -211,22 +211,33 @@ jobs:
             *) echo "FAIL store did not open clean"; exit 1 ;;
           esac
 
+      # BASH, NOT POWERSHELL, AND THE REASON IS MEASURED. Run 33104390786 failed this step with
+      # `error: missing required argument 'commandOrUrl'`: PowerShell consumed the `--`
+      # separator and everything after it, so claude received no command to register at all.
+      # bash passes `--` through verbatim. This is the same class as the here-string conflict
+      # above: PowerShell quoting rules and this workflow's needs keep disagreeing.
       - name: Register Coach the way Dan's machine does
-        shell: pwsh
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Stop'
+          set -euo pipefail
           # THE ROUTE OF RECORD (runbook 7.6). User scope is the one registration that attaches
           # on Windows: the estate has measured plugin .mcp.json and --mcp-config failing
           # SILENTLY here, which looks like a working Coach with no tools.
-          $server = Join-Path $env:GITHUB_WORKSPACE 'coach-plugin\runtime\api\server.mjs'
-          if (-not (Test-Path -LiteralPath $server -PathType Leaf)) { throw "missing $server" }
-          claude mcp add coach -s user -e COACH_ROOT=C:\coach -- node $server
-          if ($LASTEXITCODE -ne 0) { throw 'claude mcp add failed' }
+          SERVER="${GITHUB_WORKSPACE}/coach-plugin/runtime/api/server.mjs"
+          test -f "$SERVER" || { echo "missing $SERVER"; exit 1; }
 
-          $list = (& claude mcp list 2>&1 | Out-String)
-          Write-Host $list
-          if ($list -notmatch 'coach') { throw 'Claude Code does not see the coach server' }
-          Write-Host 'PASS coach is registered user-scope'
+          claude mcp add coach -s user -e 'COACH_ROOT=C:\coach' -- node "$SERVER"
+
+          # CLIENT-SIDE READBACK, and the distinction is load-bearing (VM-TESTER, 2026-08-27).
+          # Spawning server.mjs proves the SERVER runs and says nothing about whether the CLIENT
+          # attached it. Only `claude mcp list` reporting Connected is evidence of attachment,
+          # and attachment is the thing that fails silently on Windows.
+          echo '--- claude mcp list:'
+          claude mcp list 2>&1 | tee /tmp/mcp-list.txt
+          grep -q 'coach' /tmp/mcp-list.txt || { echo 'FAIL Claude Code does not see the coach server'; exit 1; }
+          grep -Eq 'coach.*(Connected|✔)' /tmp/mcp-list.txt || {
+            echo 'FAIL Claude Code sees coach but reports it NOT connected'; exit 1; }
+          echo 'PASS coach is registered user-scope AND the client reports it connected'
 
       - name: Count the tools before you ever see them
         shell: bash
@@ -264,6 +275,45 @@ jobs:
           EOF
           node tools-probe.mjs coach-plugin/runtime/api/server.mjs
           rm -f tools-probe.mjs
+
+      # F-VMT-47, MEASURED RATHER THAN ASSUMED, AND DELIBERATELY NON-BLOCKING.
+      # The SHIPPED product (windows/launch-coach.ps1:139) launches Claude with
+      # `--mcp-config <sealed>/.mcp.json --strict-mcp-config`, and carries NO user-scope path at
+      # all. On 2026-08-22 that flag pair was measured attaching ASYNCHRONOUSLY on a Windows
+      # runner, so the first prompt races the attach and usually wins: the session opens, looks
+      # entirely normal, and knows nothing about Dan. Runbook 7.6 cannot see this, because it
+      # registers user-scope and then tests THAT, so a green 7.6 is evidence about a route the
+      # product does not ship.
+      # THIS STEP IS NOT THE FIX AND DOES NOT CLAIM TO BE. It takes the one measurement nobody
+      # has taken on CURRENT Claude Code, at near-zero cost since the machine is already here.
+      # It never fails the run: the interactive session below uses the user-scope route, which
+      # is independently proven above, so a red result here costs nothing and a green one
+      # retires a blocker.
+      - name: Measure the SHIPPED activation route (report only, never blocks)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          SEALED="$RUNNER_TEMP/sealed"
+          mkdir -p "$SEALED"
+          SERVER="${GITHUB_WORKSPACE}/coach-plugin/runtime/api/server.mjs"
+          cat > "$SEALED/.mcp.json" <<EOF
+          {"mcpServers":{"coach":{"type":"stdio","command":"node","args":["$SERVER"],"env":{"COACH_ROOT":"C:\\\\coach"}}}}
+          EOF
+          echo '--- the config the shipped launcher would write:'
+          cat "$SEALED/.mcp.json"
+          echo '--- launching the shipped way, in a config dir with NO user-scope registration:'
+          out=$(CLAUDE_CONFIG_DIR="$SEALED" claude --mcp-config "$SEALED/.mcp.json" --strict-mcp-config mcp list 2>&1)
+          echo "$out"
+          if echo "$out" | grep -Eq 'coach.*(Connected|✔)'; then
+            echo 'F-VMT-47 RESULT: the shipped flag pair DID attach on this Claude Code version.'
+          else
+            echo 'F-VMT-47 RESULT: the shipped flag pair did NOT show coach connected.'
+          fi
+          echo 'CAVEAT, stated so this is not over-read: `mcp list` is not a chat turn. It does'
+          echo 'not reproduce the prompt-races-attach timing that made the 2026-08-22 failure'
+          echo 'silent. A green here weakens the finding; only a real conversation retires it.'
+          exit 0
 
       - name: How to use this session
         shell: pwsh
