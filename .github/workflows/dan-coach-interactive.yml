@@ -232,8 +232,18 @@ jobs:
           # THE ROUTE OF RECORD (runbook 7.6). User scope is the one registration that attaches
           # on Windows: the estate has measured plugin .mcp.json and --mcp-config failing
           # SILENTLY here, which looks like a working Coach with no tools.
-          SERVER="${GITHUB_WORKSPACE}/coach-plugin/runtime/api/server.mjs"
+          # FULLY FORWARD-SLASH PATH, AND THIS IS THE PROBE THE 1.1s MEASUREMENT ASKED FOR.
+          # GITHUB_WORKSPACE in Git Bash is D:\a\dan-coach-winci\dan-coach-winci, so every
+          # registration so far carried MIXED separators in args
+          # (D:\a\...\dan-coach-winci/coach-plugin/...). The Bill lane, which passes this gate
+          # on the same runner class, registers forward-slash throughout. Our client died in
+          # 1.1s, faster than this store can possibly open (11.3s measured in the same run), so
+          # the child died before touching the store — which fits a spawn/path failure and does
+          # not fit a size or timeout failure. cygpath -m emits the Windows path with forward
+          # slashes.
+          SERVER="$(cygpath -m "$GITHUB_WORKSPACE")/coach-plugin/runtime/api/server.mjs"
           test -f "$SERVER" || { echo "missing $SERVER"; exit 1; }
+          echo "server path as registered: $SERVER"
 
           # NO BACKSLASH REACHES THE SHELL, AND THAT IS THE WHOLE FIX. Two runs died here:
           #   33104655356  `mcp add -e COACH_ROOT=C:\coach`  -> registered, then
@@ -320,7 +330,11 @@ jobs:
             process.exit(5);
           }, 90000);
           EOF
-          NODE_BIN="$(command -v node)"
+          # process.execPath, NOT `command -v node`: the latter returns a Git Bash POSIX path
+          # (/c/hostedtoolcache/...) that a Windows spawn cannot resolve. Measured in run
+          # 33107002357: SPAWN ERROR ... ENOENT, so the probe never reached Coach and answered
+          # nothing. execPath is the running node's own real Windows path, .exe included.
+          NODE_BIN="$(node -p 'process.execPath')"
           echo "node resolves to: $NODE_BIN"
           node hs.mjs "$NODE_BIN" "$SERVER" || echo "(handshake probe exit $?)"
           rm -f hs.mjs
@@ -329,14 +343,32 @@ jobs:
           # Spawning server.mjs proves the SERVER runs and says nothing about whether the CLIENT
           # attached it. Only `claude mcp list` reporting Connected is evidence of attachment,
           # and attachment is the thing that fails silently on Windows.
-          echo '--- claude mcp list:'
+          echo '--- claude mcp list (latest client):'
+          claude --version
           claude mcp list 2>&1 | tee /tmp/mcp-list.txt
-          grep -q 'coach' /tmp/mcp-list.txt || { echo 'FAIL Claude Code does not see the coach server'; exit 1; }
-          grep -Eq 'coach.*(Connected|✔)' /tmp/mcp-list.txt || {
-            echo 'FAIL Claude Code sees coach but reports it NOT connected.'
-            echo 'The handshake result above says whether the SERVER or the ATTACHMENT is at fault.'
-            exit 1; }
-          echo 'PASS coach is registered user-scope AND the client reports it connected'
+          if grep -Eq 'coach.*(Connected|✔)' /tmp/mcp-list.txt; then
+            echo 'PASS coach attaches: latest client, forward-slash path'
+          else
+            # SECOND VARIABLE, ISOLATED ONLY IF THE FIRST FAILS. The Bill interactive lane
+            # PINS the client at 2.1.238; its smoke lane passed on latest as of 2026-08-25.
+            # If forward-slash still fails on today's latest, install the pinned control
+            # version and read the identical probe again. Sequenced this way, each attempt
+            # isolates one variable, and a green on 2.1.238 still delivers the session
+            # tonight instead of burning another dispatch.
+            echo 'NOT CONNECTED on latest with a forward-slash path.'
+            echo 'Installing the control version 2.1.238 (the Bill interactive pin) and retrying:'
+            npm install -g @anthropic-ai/claude-code@2.1.238
+            claude --version
+            claude mcp list 2>&1 | tee /tmp/mcp-list-238.txt
+            if grep -Eq 'coach.*(Connected|✔)' /tmp/mcp-list-238.txt; then
+              echo 'RESULT: attaches on 2.1.238, not on latest -> CLIENT VERSION REGRESSION; path was not the cause.'
+              echo 'Continuing to the session on 2.1.238.'
+            else
+              echo 'RESULT: fails on BOTH client versions with a forward-slash path.'
+              echo 'The handshake result above says whether the SERVER or the ATTACHMENT is at fault.'
+              exit 1
+            fi
+          fi
 
       - name: Count the tools before you ever see them
         shell: bash
@@ -393,9 +425,9 @@ jobs:
         shell: bash
         run: |
           set +e
-          SEALED="$RUNNER_TEMP/sealed"
+          SEALED="$(cygpath -m "$RUNNER_TEMP")/sealed"
           mkdir -p "$SEALED"
-          SERVER="${GITHUB_WORKSPACE}/coach-plugin/runtime/api/server.mjs"
+          SERVER="$(cygpath -m "$GITHUB_WORKSPACE")/coach-plugin/runtime/api/server.mjs"
           # Forward slashes here too, for the reason documented on the registration step: a
           # backslash in a JSON string does not survive Git Bash intact and produces a document
           # that fails to parse rather than a path that fails to resolve.
