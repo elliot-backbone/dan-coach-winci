@@ -494,7 +494,7 @@ jobs:
           Write-Host ''
           Write-Host '================ COACH IS RUNNING ================'
           Write-Host ''
-          Write-Host '  Connect with the SSH line below, then run:'
+          Write-Host '  Connect with the SSH line printed by the next step, then run:'
           Write-Host ''
           Write-Host '      claude'
           Write-Host ''
@@ -511,25 +511,87 @@ jobs:
           Write-Host ''
           Write-Host '=================================================='
 
-      - name: Open the session
-        id: tmate
-        uses: mxschmitt/action-tmate@v3
-        with:
-          limit-access-to-actor: true
-          detached: true
-
-      - name: Publish the connection string
-        shell: bash
-        env:
-          TMATE_SSH_COMMAND: ${{ steps.tmate.outputs.ssh-command }}
+      # NATIVE OpenSSH PLUS A CLOUDFLARE QUICK TUNNEL, REPLACING action-tmate.
+      # tmate ON WINDOWS HAS NEVER COMPLETED IN THIS ESTATE: the Bill lane's only interactive
+      # run was cancelled at "tmate-2.4.0-5-x86_64 downloading...", and run 33108478227 here
+      # hung inside the tmate step for 59 minutes with every product gate already green.
+      # Windows ships an OpenSSH server; the runner reaches Cloudflare outbound; the
+      # operator's ed25519 key is already registered on GitHub. Nothing here needs an account
+      # or a secret: the tunnel is an anonymous quick tunnel, and the only accepted credential
+      # is the public key below, which is world-readable at github.com/elliot-backbone.keys by
+      # design. AUTH IS PUBKEY ONLY, password auth forced off, so the hostname printed in this
+      # public log admits nobody but the holder of the matching private key.
+      # UNPROVEN CAVEAT, stated because nothing local can rehearse Windows sshd: this is the
+      # one step that could not be run on the host first. It carries a hard 8-minute timeout
+      # and prints sshd state and the tunnel log on failure, so a red here is diagnosable
+      # rather than another silent hang.
+      - name: Open the SSH door
+        timeout-minutes: 8
+        shell: pwsh
         run: |
-          ssh_line="${TMATE_SSH_COMMAND:-}"
-          if [[ -z "$ssh_line" || "$ssh_line" != ssh\ * || "$ssh_line" == *$'\n'* ]]; then
-            echo "::error title=No valid connection string::action-tmate did not return one SSH command"
-            exit 1
-          fi
-          echo "::notice title=Connect with this::${ssh_line}"
-          { echo "### Connect"; echo '```'; echo "${ssh_line}"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          $ErrorActionPreference = 'Stop'
+
+          # 1. OpenSSH server on, pubkey in, passwords off.
+          $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
+          if ($cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
+          $keys = 'C:\ProgramData\ssh\administrators_authorized_keys'
+          New-Item -ItemType Directory -Path 'C:\ProgramData\ssh' -Force | Out-Null
+          Set-Content -LiteralPath $keys -Encoding ascii -Value 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM27IN3VwfBq5VeDV58ZDOl46r1vDcze1A8r6qhIoNI0 elliot-backbone'
+          icacls $keys /inheritance:r /grant 'SYSTEM:F' /grant 'BUILTIN\Administrators:F' | Out-Null
+          Start-Service sshd
+          Add-Content -LiteralPath 'C:\ProgramData\ssh\sshd_config' -Value "`nPasswordAuthentication no`nPubkeyAuthentication yes"
+          New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
+            -Value 'C:\Program Files\PowerShell\7\pwsh.exe' -PropertyType String -Force | Out-Null
+          Restart-Service sshd
+          Write-Host "sshd: $((Get-Service sshd).Status), password auth off, pubkey pinned"
+
+          # 2. An SSH login gets the MACHINE environment, not this job's. Without these lines
+          # the session would find neither node nor claude, and Coach would be unreachable in
+          # exactly the way that looks like a product failure.
+          $nodeDir = Split-Path (Get-Command node).Source
+          $claudeDir = Split-Path (Get-Command claude).Source
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          [Environment]::SetEnvironmentVariable('Path', "$machinePath;$nodeDir;$claudeDir", 'Machine')
+          [Environment]::SetEnvironmentVariable('COACH_ROOT', 'C:/coach', 'Machine')
+          Write-Host "machine PATH now carries: $nodeDir ; $claudeDir"
+
+          # 3. The tunnel: anonymous quick tunnel, TCP to local sshd, hostname parsed from
+          # cloudflared's own log.
+          $cf = Join-Path $env:RUNNER_TEMP 'cloudflared.exe'
+          Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' `
+            -OutFile $cf -UseBasicParsing
+          $cfLog = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
+          Start-Process -FilePath $cf -WindowStyle Hidden `
+            -ArgumentList 'tunnel','--url','tcp://localhost:22','--no-autoupdate','--logfile',$cfLog
+          $tunnelHost = $null
+          foreach ($i in 1..45) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $cfLog) {
+              $m = Select-String -LiteralPath $cfLog -Pattern '([a-z0-9-]+\.trycloudflare\.com)' | Select-Object -First 1
+              if ($m) { $tunnelHost = $m.Matches[0].Groups[1].Value; break }
+            }
+          }
+          if (-not $tunnelHost) {
+            Write-Host '--- cloudflared log tail:'
+            if (Test-Path $cfLog) { Get-Content $cfLog -Tail 30 }
+            throw 'no trycloudflare hostname within 90s'
+          }
+
+          $connect = "ssh -o ProxyCommand=`"cloudflared access tcp --hostname %h`" runneradmin@$tunnelHost"
+          Write-Host "::notice title=Connect with this::$connect"
+          $keepOpen = Join-Path $env:RUNNER_TEMP 'keep-open'
+          @(
+            '### Connect'
+            '```'
+            $connect
+            '```'
+            'Needs cloudflared locally (brew install cloudflared). Auth is your ed25519 key only.'
+            "Then run claude, sign in once, and talk to Coach. End early: Remove-Item '$keepOpen'"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Host ''
+          Write-Host "CONNECT WITH:  $connect"
+          Write-Host "END EARLY (inside the session):  Remove-Item '$keepOpen'"
 
       - name: Hold the runner open
         shell: pwsh
