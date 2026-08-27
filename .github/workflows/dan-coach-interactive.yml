@@ -226,18 +226,34 @@ jobs:
           SERVER="${GITHUB_WORKSPACE}/coach-plugin/runtime/api/server.mjs"
           test -f "$SERVER" || { echo "missing $SERVER"; exit 1; }
 
-          # add-json, NOT `add -e`, AND THE REASON IS MEASURED. Run 33104655356 registered
-          # successfully and then reported `Failed to connect - -32000: Connection closed`.
-          # The store itself was fine: the step before it opened the same store with the same
-          # COACH_ROOT and printed integrity ok. The difference is how the value travelled.
-          # Git Bash applies MSYS path conversion to arguments, so `-e COACH_ROOT=C:\coach`
-          # does not necessarily reach the child as that string, and a server that cannot find
-          # its store exits, which the client reports only as a closed connection.
-          # add-json takes one JSON document and skips argument parsing, and MSYS_NO_PATHCONV
-          # stops the shell rewriting the path inside it.
-          export MSYS_NO_PATHCONV=1
+          # NO BACKSLASH REACHES THE SHELL, AND THAT IS THE WHOLE FIX. Two runs died here:
+          #   33104655356  `mcp add -e COACH_ROOT=C:\coach`  -> registered, then
+          #                `Failed to connect - -32000: Connection closed`
+          #   33105154467  `mcp add-json` with "C:\\\\coach" -> `Invalid configuration: : Invalid input`
+          # The second error was reproduced exactly on the host: Git Bash delivered ONE
+          # backslash instead of two, and `"C:\coach"` is not valid JSON because \c is not an
+          # escape, so the document failed to parse before Claude ever saw it. MSYS_NO_PATHCONV
+          # did not prevent it.
+          # WINDOWS ACCEPTS FORWARD SLASHES IN PATHS, so C:/coach removes the escaping problem
+          # at its source rather than trying to quote around it. Verified on the host: the
+          # entry stores as {"COACH_ROOT":"C:/coach"}.
+          # The JSON is also built by node and read from a file, so no shell quoting stands
+          # between the document and the CLI.
+          export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
           claude mcp remove coach -s user >/dev/null 2>&1 || true
-          claude mcp add-json coach "{\"type\":\"stdio\",\"command\":\"node\",\"args\":[\"${SERVER}\"],\"env\":{\"COACH_ROOT\":\"C:\\\\coach\"}}" --scope user
+          node -e '
+            const fs = require("node:fs");
+            fs.writeFileSync("coach-mcp.json", JSON.stringify({
+              type: "stdio",
+              command: "node",
+              args: [process.argv[1]],
+              env: { COACH_ROOT: "C:/coach" }
+            }));
+          ' "$SERVER"
+          echo '--- the document being registered:'
+          cat coach-mcp.json; echo
+          claude mcp add-json coach "$(cat coach-mcp.json)" --scope user
+          rm -f coach-mcp.json
 
           # READ BACK WHAT ACTUALLY LANDED. A registration that reports success and stores the
           # wrong env is exactly the silent shape this workflow exists to catch, so the stored
@@ -263,7 +279,7 @@ jobs:
             echo 'FAIL Claude Code sees coach but reports it NOT connected.'
             echo '--- running the server by hand with the same env, to surface its own error:'
             echo 'the client reports only "Connection closed"; the server says why.'
-            COACH_ROOT='C:\coach' node "$SERVER" </dev/null 2>&1 | head -20 || true
+            COACH_ROOT='C:/coach' node "$SERVER" </dev/null 2>&1 | head -20 || true
             exit 1; }
           echo 'PASS coach is registered user-scope AND the client reports it connected'
 
@@ -325,9 +341,15 @@ jobs:
           SEALED="$RUNNER_TEMP/sealed"
           mkdir -p "$SEALED"
           SERVER="${GITHUB_WORKSPACE}/coach-plugin/runtime/api/server.mjs"
-          cat > "$SEALED/.mcp.json" <<EOF
-          {"mcpServers":{"coach":{"type":"stdio","command":"node","args":["$SERVER"],"env":{"COACH_ROOT":"C:\\\\coach"}}}}
-          EOF
+          # Forward slashes here too, for the reason documented on the registration step: a
+          # backslash in a JSON string does not survive Git Bash intact and produces a document
+          # that fails to parse rather than a path that fails to resolve.
+          node -e '
+            const fs = require("node:fs");
+            fs.writeFileSync(process.argv[2], JSON.stringify({ mcpServers: { coach: {
+              type: "stdio", command: "node", args: [process.argv[1]],
+              env: { COACH_ROOT: "C:/coach" } } } }));
+          ' "$SERVER" "$SEALED/.mcp.json"
           echo '--- the config the shipped launcher would write:'
           cat "$SEALED/.mcp.json"
           echo '--- launching the shipped way, in a config dir with NO user-scope registration:'
