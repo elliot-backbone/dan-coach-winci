@@ -232,18 +232,54 @@ jobs:
           # THE ROUTE OF RECORD (runbook 7.6). User scope is the one registration that attaches
           # on Windows: the estate has measured plugin .mcp.json and --mcp-config failing
           # SILENTLY here, which looks like a working Coach with no tools.
-          # FULLY FORWARD-SLASH PATH, AND THIS IS THE PROBE THE 1.1s MEASUREMENT ASKED FOR.
-          # GITHUB_WORKSPACE in Git Bash is D:\a\dan-coach-winci\dan-coach-winci, so every
-          # registration so far carried MIXED separators in args
-          # (D:\a\...\dan-coach-winci/coach-plugin/...). The Bill lane, which passes this gate
-          # on the same runner class, registers forward-slash throughout. Our client died in
-          # 1.1s, faster than this store can possibly open (11.3s measured in the same run), so
-          # the child died before touching the store — which fits a spawn/path failure and does
-          # not fit a size or timeout failure. cygpath -m emits the Windows path with forward
-          # slashes.
-          SERVER="$(cygpath -m "$GITHUB_WORKSPACE")/coach-plugin/runtime/api/server.mjs"
-          test -f "$SERVER" || { echo "missing $SERVER"; exit 1; }
-          echo "server path as registered: $SERVER"
+          # ROOT CAUSE, FOUND IN RUN 33108029320 AND CLOSED HERE. server.mjs:573 guards its
+          # entry with `import.meta.url === \`file://\${process.argv[1]}\``. On POSIX argv[1]
+          # is /Users/... so the concatenation matches. On Windows argv[1] is D:\a\...\server.mjs
+          # while import.meta.url is file:///D:/a/..., so the comparison is STRUCTURALLY FALSE
+          # in every spelling. The module loads, the guard fails, nothing holds the event loop,
+          # and node exits 0 — measured on the runner as `SERVER EXITED code=0 signal=null`,
+          # no stderr, in about a second, on client 2.1.247 AND 2.1.238, with mixed AND
+          # forward-slash paths. The shipped Windows package already knows: its
+          # coach-mcp-entry.mjs header says the canonical direct-entry comparison is
+          # POSIX-shaped and exists precisely to own the stdio lifecycle instead. That entry
+          # imports the PACKAGED layout (../../app/...) and cannot run from a raw checkout, so
+          # this lane lifts the server.mjs direct-entry block VERBATIM, guard removed, imports
+          # made relative to the checkout. Proven on the host against the promoted store:
+          # HANDSHAKE OK server=coach, TOOLS=12.
+          # CONSEQUENCE FOR THE RUNBOOK, reported to the fleet: 7.6's fallback command
+          # (`claude mcp add ... -- node ...\server.mjs`) registers a structural no-op on
+          # Windows. Only an entry file that starts unconditionally can attach there.
+          cat > coach-win-entry.mjs <<'EOF'
+          // server.mjs:573-594 at a18f283a, lifted verbatim with the POSIX-shaped entry guard
+          // removed. The canonical modules do all the work; this file only owns stdio.
+          import { openCoachStore, COACH_DB } from './coach-plugin/runtime/store/unified/open-coach-store.mjs';
+          import { createStateAdapter } from './coach-plugin/runtime/store/state-adapter.mjs';
+          import { createServer } from './coach-plugin/runtime/api/server.mjs';
+
+          const db = openCoachStore(COACH_DB, { readOnly: false });
+          const state = createStateAdapter(db);
+          const server = createServer({ db, state });
+
+          let buf = '';
+          process.stdin.setEncoding('utf8');
+          process.stdin.on('data', (chunk) => {
+            buf += chunk;
+            let idx;
+            while ((idx = buf.indexOf('\n')) !== -1) {
+              const line = buf.slice(0, idx);
+              buf = buf.slice(idx + 1);
+              if (!line.trim()) continue;
+              let msg;
+              try { msg = JSON.parse(line); } catch { continue; }
+              const reply = server.handle(msg);
+              if (reply) process.stdout.write(JSON.stringify(reply) + '\n');
+            }
+          });
+          process.stdin.on('end', () => process.exit(0));
+          EOF
+          ENTRY="$(cygpath -m "$GITHUB_WORKSPACE")/coach-win-entry.mjs"
+          test -f "$ENTRY" || { echo "missing $ENTRY"; exit 1; }
+          echo "entry as registered: $ENTRY"
 
           # NO BACKSLASH REACHES THE SHELL, AND THAT IS THE WHOLE FIX. Two runs died here:
           #   33104655356  `mcp add -e COACH_ROOT=C:\coach`  -> registered, then
@@ -268,7 +304,7 @@ jobs:
               args: [process.argv[1]],
               env: { COACH_ROOT: "C:/coach" }
             }));
-          ' "$SERVER"
+          ' "$ENTRY"
           echo '--- the document being registered:'
           cat coach-mcp.json; echo
           claude mcp add-json coach "$(cat coach-mcp.json)" --scope user
@@ -336,7 +372,7 @@ jobs:
           # nothing. execPath is the running node's own real Windows path, .exe included.
           NODE_BIN="$(node -p 'process.execPath')"
           echo "node resolves to: $NODE_BIN"
-          node hs.mjs "$NODE_BIN" "$SERVER" || echo "(handshake probe exit $?)"
+          node hs.mjs "$NODE_BIN" "$ENTRY" || echo "(handshake probe exit $?)"
           rm -f hs.mjs
 
           # CLIENT-SIDE READBACK, and the distinction is load-bearing (VM-TESTER, 2026-08-27).
@@ -404,7 +440,7 @@ jobs:
           child.on('exit', (c) => { console.log('TOOLS=server-exited-' + c); process.exit(1); });
           setTimeout(() => { console.log('TOOLS=timeout'); process.exit(1); }, 60000);
           EOF
-          node tools-probe.mjs coach-plugin/runtime/api/server.mjs
+          node tools-probe.mjs coach-win-entry.mjs
           rm -f tools-probe.mjs
 
       # F-VMT-47, MEASURED RATHER THAN ASSUMED, AND DELIBERATELY NON-BLOCKING.
