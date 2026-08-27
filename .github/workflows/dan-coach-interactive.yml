@@ -57,6 +57,15 @@ jobs:
   session:
     runs-on: windows-latest
     timeout-minutes: 358
+    env:
+      # Claude Code gives an MCP server 30 seconds to complete its handshake by default, and
+      # reports a server that misses it as `Connection closed`, which is indistinguishable from
+      # a crash. Coach opens a 1.15 GB store at startup: the gate step alone measured 14 seconds
+      # for open plus integrity check on this runner class, on a cold file that was written
+      # seconds earlier. That is uncomfortably close to the ceiling and the first open is the
+      # slowest one. Raising the timeout costs nothing when the server is fast and removes a
+      # false failure when the disk is slow.
+      MCP_TIMEOUT: '120000'
 
     steps:
       # FAIL ON THE MISSING CREDENTIAL FIRST, BY NAME. Without this the run dies inside
@@ -268,6 +277,54 @@ jobs:
             console.log(c ? JSON.stringify(c,null,2) : 'NO coach ENTRY FOUND in '+f);
           "
 
+          # HANDSHAKE THE SERVER OURSELVES BEFORE ASKING THE CLIENT ABOUT IT.
+          # Run 33105519392 stored a PERFECT config (COACH_ROOT C:/coach, correct args) and the
+          # client still said `Connection closed`. That error means the process ended, and it
+          # never says why. The previous fallback ran the server with stdin at /dev/null, which
+          # makes it read EOF and exit cleanly with no output, so it proved nothing: a healthy
+          # server and a broken one look identical under that test.
+          # This does what the client does. It sends initialize, waits for a reply, and keeps
+          # stderr, so the server's own words reach this log whether it answers or dies.
+          echo '--- handshaking the server directly (stderr captured):'
+          cat > hs.mjs <<'EOF'
+          import { spawn } from 'node:child_process';
+          const child = spawn(process.argv[2], [process.argv[3]], {
+            env: { ...process.env, COACH_ROOT: 'C:/coach' },
+            stdio: ['pipe', 'pipe', 'pipe'],
+          });
+          let err = '';
+          child.stderr.on('data', (d) => { err += d; });
+          child.on('error', (e) => { console.log('SPAWN ERROR: ' + e.message); process.exit(3); });
+          child.on('exit', (c, s) => {
+            console.log(`SERVER EXITED code=${c} signal=${s}`);
+            if (err.trim()) console.log('SERVER STDERR:\n' + err.trim().slice(0, 2000));
+            process.exit(4);
+          });
+          let buf = '';
+          child.stdout.on('data', (d) => {
+            buf += d;
+            const lines = buf.split('\n'); buf = lines.pop();
+            for (const line of lines) {
+              let m; try { m = JSON.parse(line); } catch { continue; }
+              if (m.id === 1) {
+                console.log('HANDSHAKE OK: server=' + (m.result?.serverInfo?.name ?? '?'));
+                child.kill(); process.exit(0);
+              }
+            }
+          });
+          child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+            protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'hs', version: '1' } } }) + '\n');
+          setTimeout(() => {
+            console.log('HANDSHAKE TIMEOUT after 90s, server still alive and silent');
+            if (err.trim()) console.log('SERVER STDERR:\n' + err.trim().slice(0, 2000));
+            process.exit(5);
+          }, 90000);
+          EOF
+          NODE_BIN="$(command -v node)"
+          echo "node resolves to: $NODE_BIN"
+          node hs.mjs "$NODE_BIN" "$SERVER" || echo "(handshake probe exit $?)"
+          rm -f hs.mjs
+
           # CLIENT-SIDE READBACK, and the distinction is load-bearing (VM-TESTER, 2026-08-27).
           # Spawning server.mjs proves the SERVER runs and says nothing about whether the CLIENT
           # attached it. Only `claude mcp list` reporting Connected is evidence of attachment,
@@ -277,9 +334,7 @@ jobs:
           grep -q 'coach' /tmp/mcp-list.txt || { echo 'FAIL Claude Code does not see the coach server'; exit 1; }
           grep -Eq 'coach.*(Connected|✔)' /tmp/mcp-list.txt || {
             echo 'FAIL Claude Code sees coach but reports it NOT connected.'
-            echo '--- running the server by hand with the same env, to surface its own error:'
-            echo 'the client reports only "Connection closed"; the server says why.'
-            COACH_ROOT='C:/coach' node "$SERVER" </dev/null 2>&1 | head -20 || true
+            echo 'The handshake result above says whether the SERVER or the ATTACHMENT is at fault.'
             exit 1; }
           echo 'PASS coach is registered user-scope AND the client reports it connected'
 
