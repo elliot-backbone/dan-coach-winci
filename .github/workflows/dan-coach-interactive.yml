@@ -50,8 +50,15 @@ on:
         required: true
         default: '240'
 
+# contents: write, and the widening has one purpose: run 33165675849 (2026-08-28) minted a
+# healthy tunnel whose ::notice never surfaced — the annotations API served ZERO annotations
+# for 5+ minutes while logs stay sealed until job end, so a working VM was unreachable because
+# its hostname had no live path off the runner. The connect line now also lands in a branch
+# file (connect/<run_id>/CONNECT.txt) written via the REST contents API, which is pollable the
+# second the write returns. The token is repo-scoped to THIS public repo; the private
+# repository is still reached only by DAN_COACH_READ_TOKEN.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   session:
@@ -528,6 +535,8 @@ jobs:
       - name: Open the SSH door
         timeout-minutes: 8
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -580,6 +589,29 @@ jobs:
 
           $connect = "ssh -o ProxyCommand=`"cloudflared access tcp --hostname %h`" runneradmin@$tunnelHost"
           Write-Host "::notice title=Connect with this::$connect"
+
+          # PUBLISH THE LINE OFF THE RUNNER, TWO CHANNELS, NEITHER THE ANNOTATIONS FEED.
+          # (1) a file for the artifact step below; (2) a branch file via the REST contents
+          # API, live the moment this PUT returns. Publish failures are REPORTED, never fatal:
+          # the tunnel is up, and killing the session over a delivery channel would repeat the
+          # exact failure shape this exists to fix.
+          Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'connect.txt') -Value @(
+            $connect
+            "minted=$([DateTime]::UtcNow.ToString('o')) restart=0 run=${{ github.run_id }}"
+          )
+          try {
+            $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+            Invoke-RestMethod -Method Post -Headers $hdr `
+              -Uri 'https://api.github.com/repos/${{ github.repository }}/git/refs' `
+              -Body (@{ ref = 'refs/heads/connect/${{ github.run_id }}'; sha = '${{ github.sha }}' } | ConvertTo-Json) | Out-Null
+            $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $env:RUNNER_TEMP 'connect.txt')))
+            Invoke-RestMethod -Method Put -Headers $hdr `
+              -Uri 'https://api.github.com/repos/${{ github.repository }}/contents/CONNECT.txt' `
+              -Body (@{ message = 'connect line'; content = $b64; branch = 'connect/${{ github.run_id }}' } | ConvertTo-Json) | Out-Null
+            Write-Host 'PASS connect line published to branch connect/${{ github.run_id }}'
+          } catch {
+            Write-Host "WARN branch publish failed (artifact channel still carries the line): $($_.Exception.Message)"
+          }
           $keepOpen = Join-Path $env:RUNNER_TEMP 'keep-open'
           @(
             '### Connect'
@@ -592,6 +624,20 @@ jobs:
           Write-Host ''
           Write-Host "CONNECT WITH:  $connect"
           Write-Host "END EARLY (inside the session):  Remove-Item '$keepOpen'"
+
+      # THE INITIAL LINE ALSO SHIPS AS A RUN ARTIFACT — v4 artifacts are listable and
+      # downloadable via the API the moment this step completes, mid-run included. RESTARTS
+      # CANNOT USE THIS CHANNEL: ACTIONS_RUNTIME_TOKEN is not exposed to `run:` steps, so the
+      # supervisor loop cannot re-upload; restart lines travel by the branch file alone.
+      # continue-on-error because the branch file already carries the line and a delivery
+      # channel must never kill a healthy session.
+      - name: Publish the connect line as a run artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: connect-line
+          path: ${{ runner.temp }}/connect.txt
+          retention-days: 1
 
       # THE HOLD LOOP IS ALSO THE TUNNEL SUPERVISOR, AND THE REASON IS A MEASURED DEATH.
       # Run 33164632298 (2026-08-28): every gate green, SSH door opened, connect line issued —
@@ -607,7 +653,30 @@ jobs:
       # nobody can reach.
       - name: Hold the runner open (and keep the tunnel alive)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # A restart mints a fresh hostname, and a hostname nobody receives is the 33165675849
+          # failure again. Same channel as the door step: overwrite CONNECT.txt on the
+          # connect/<run_id> branch. Reported-never-fatal, same reason.
+          function Publish-ConnectLine([string]$line, [int]$restart) {
+            try {
+              $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+              $uri = 'https://api.github.com/repos/${{ github.repository }}/contents/CONNECT.txt'
+              $prev = $null
+              try { $prev = (Invoke-RestMethod -Headers $hdr -Uri "${uri}?ref=connect/${{ github.run_id }}").sha } catch {}
+              $content = "$line`nminted=$([DateTime]::UtcNow.ToString('o')) restart=$restart run=${{ github.run_id }}"
+              $body = @{ message = "connect line (restart $restart)"
+                         content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($content))
+                         branch = 'connect/${{ github.run_id }}' }
+              if ($prev) { $body.sha = $prev }
+              Invoke-RestMethod -Method Put -Headers $hdr -Uri $uri -Body ($body | ConvertTo-Json) | Out-Null
+              Write-Host "PASS restart $restart connect line published to branch"
+            } catch {
+              Write-Host "WARN restart $restart branch publish failed: $($_.Exception.Message)"
+            }
+          }
+
           $minutes = [int]'${{ github.event.inputs.minutes }}'
           Write-Host "Session open for $minutes minutes. Connect with the SSH command above."
           Write-Host 'It ends early if you delete this file from inside the session:'
@@ -655,6 +724,7 @@ jobs:
               $connect = "ssh -o ProxyCommand=`"cloudflared access tcp --hostname %h`" runneradmin@$tunnelHost"
               Write-Host "::notice title=Connect line CHANGED (tunnel restart $restartIndex)::$connect"
               Write-Host "NEW CONNECT LINE (restart ${restartIndex}):  $connect"
+              Publish-ConnectLine $connect $restartIndex
               @("### Tunnel restarted ($restartIndex) — new connect line", '```', $connect, '```') |
                 Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             } else {
@@ -667,8 +737,18 @@ jobs:
       - name: Leave nothing behind
         if: always()
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # The runner is discarded anyway, but an aborted job should not leave Dan's record
           # sitting on a machine that is still running.
           Remove-Item -Recurse -Force 'C:\coach' -ErrorAction SilentlyContinue
           Write-Host 'store removed'
+          # The connect branch is dead the moment the runner is: the hostname it names admits
+          # nobody once the tunnel closes, and a pile of connect/<run_id> branches is noise.
+          try {
+            $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+            Invoke-RestMethod -Method Delete -Headers $hdr `
+              -Uri 'https://api.github.com/repos/${{ github.repository }}/git/refs/heads/connect/${{ github.run_id }}' | Out-Null
+            Write-Host 'connect branch removed'
+          } catch { Write-Host 'no connect branch to remove' }
