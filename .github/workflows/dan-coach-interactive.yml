@@ -593,7 +593,19 @@ jobs:
           Write-Host "CONNECT WITH:  $connect"
           Write-Host "END EARLY (inside the session):  Remove-Item '$keepOpen'"
 
-      - name: Hold the runner open
+      # THE HOLD LOOP IS ALSO THE TUNNEL SUPERVISOR, AND THE REASON IS A MEASURED DEATH.
+      # Run 33164632298 (2026-08-28): every gate green, SSH door opened, connect line issued —
+      # and within ~30 minutes the quick-tunnel hostname returned NXDOMAIN from 1.1.1.1 AND
+      # 8.8.8.8 while the runner held on, unreachable, for what would have been another 3.5
+      # hours. A quick tunnel drops its DNS record when cloudflared exits, and nothing on the
+      # runner restarted it, so the session was unrecoverable from outside by construction.
+      # This loop closes that: it watches the cloudflared process every 15 seconds, restarts
+      # it with backoff when it dies, prints EACH NEW HOSTNAME to this live log and as a
+      # ::notice (a restart mints a fresh hostname — the old connect line is dead the moment
+      # this prints a new one), and fails the step LOUDLY after 5 consecutive fast deaths
+      # (a tunnel that lived 5+ minutes resets the counter) rather than holding a machine
+      # nobody can reach.
+      - name: Hold the runner open (and keep the tunnel alive)
         shell: pwsh
         run: |
           $minutes = [int]'${{ github.event.inputs.minutes }}'
@@ -602,8 +614,53 @@ jobs:
           Write-Host "  $env:RUNNER_TEMP\keep-open"
           New-Item -ItemType File -Path "$env:RUNNER_TEMP\keep-open" -Force | Out-Null
           $deadline = (Get-Date).AddMinutes($minutes)
+
+          $cf = Join-Path $env:RUNNER_TEMP 'cloudflared.exe'
+          $tunnelStart = Get-Date   # the SSH-door step started the tunnel moments ago
+          $consecutiveFastDeaths = 0
+          $restartIndex = 0
+
           while ((Get-Date) -lt $deadline -and (Test-Path "$env:RUNNER_TEMP\keep-open")) {
             Start-Sleep -Seconds 15
+            if (Get-Process cloudflared -ErrorAction SilentlyContinue) { continue }
+
+            # The tunnel is dead. Died fast, or after honest service?
+            $lifeSeconds = ((Get-Date) - $tunnelStart).TotalSeconds
+            if ($lifeSeconds -lt 300) { $consecutiveFastDeaths++ } else { $consecutiveFastDeaths = 1 }
+            Write-Host ("TUNNEL DIED after {0:N0}s (consecutive fast deaths: {1}/5)" -f $lifeSeconds, $consecutiveFastDeaths)
+            if ($consecutiveFastDeaths -ge 5) {
+              Write-Host '::error title=Tunnel unrecoverable::cloudflared died 5 times in quick succession; ending the hold rather than keeping an unreachable machine.'
+              exit 1
+            }
+
+            $backoff = [Math]::Min(5 * [Math]::Pow(2, $consecutiveFastDeaths - 1), 60)
+            Write-Host "Restarting tunnel in $backoff s..."
+            Start-Sleep -Seconds $backoff
+
+            $restartIndex++
+            $cfLog = Join-Path $env:RUNNER_TEMP "cloudflared-restart-$restartIndex.log"
+            $tunnelStart = Get-Date
+            Start-Process -FilePath $cf -WindowStyle Hidden `
+              -ArgumentList 'tunnel','--url','tcp://localhost:22','--no-autoupdate','--logfile',$cfLog
+
+            $tunnelHost = $null
+            foreach ($i in 1..45) {
+              Start-Sleep -Seconds 2
+              if (Test-Path $cfLog) {
+                $m = Select-String -LiteralPath $cfLog -Pattern '([a-z0-9-]+\.trycloudflare\.com)' | Select-Object -First 1
+                if ($m) { $tunnelHost = $m.Matches[0].Groups[1].Value; break }
+              }
+            }
+            if ($tunnelHost) {
+              $connect = "ssh -o ProxyCommand=`"cloudflared access tcp --hostname %h`" runneradmin@$tunnelHost"
+              Write-Host "::notice title=Connect line CHANGED (tunnel restart $restartIndex)::$connect"
+              Write-Host "NEW CONNECT LINE (restart ${restartIndex}):  $connect"
+              @("### Tunnel restarted ($restartIndex) — new connect line", '```', $connect, '```') |
+                Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            } else {
+              Write-Host "Restart $restartIndex produced no hostname within 90s; the watch loop will see the dead process and try again."
+              if (Test-Path $cfLog) { Write-Host '--- cloudflared log tail:'; Get-Content $cfLog -Tail 15 }
+            }
           }
           Write-Host 'Session closing.'
 
